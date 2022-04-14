@@ -44,7 +44,7 @@ from imagination import SingleStepImagination
 from utils import to_np, EpisodeStats
 
 
-ex = sacred.Experiment()
+ex = sacred.Experiment(save_git_info=False) #Added save_git_info=False to prevent a git error 
 
 configure_logger()
 logger = logging.getLogger(__file__)
