@@ -11,7 +11,6 @@ warnings.filterwarnings(action='ignore', module='gym', category=FutureWarning)
 from time import perf_counter
 from dotmap import DotMap
 from functools import wraps
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,7 +18,6 @@ import os
 import sacred
 import gym
 import neptune
-import sys
 from env_loop import EnvLoop
 from datetime import datetime
 from logger import configure_logger
@@ -35,7 +33,9 @@ import sacred_utils  # For a custom mongodb flag
 from radam import RAdam
 from reward_model import RewardModel
 from td3 import TD3
+from td3_taylor import TD3_Taylor
 from ddpg import DDPG
+from Residual_MAGE import Residual_MAGE
 from wrappers import BoundedActionsEnv, IsDoneEnv, MuJoCoCloseFixWrapper, RecordedEnv
 from buffer import Buffer
 from models import Model
@@ -44,7 +44,7 @@ from imagination import SingleStepImagination
 from utils import to_np, EpisodeStats
 
 
-ex = sacred.Experiment(save_git_info=False) #Added save_git_info=False to prevent a git error 
+ex = sacred.Experiment(save_git_info=False)# Needed to add it to run on BP as don't have python git dependecies...
 
 configure_logger()
 logger = logging.getLogger(__file__)
@@ -60,7 +60,9 @@ def main_config():
     n_warm_up_steps = 1000                          # number of steps on real MDP to populate the initial buffer, actions selected by random agent
 
     normalize_data = True                           # normalize states, actions, next states to zero mean and unit variance (both for model training and policy training)
-
+    run_type = 'trial' 
+    run_number = 88
+    seed = 891 # REMOVE, for testing purpose only!
 
 # noinspection PyUnusedLocal
 @ex.config
@@ -129,7 +131,7 @@ def policy_training_config(env_name):
 
 # noinspection PyUnusedLocal
 @ex.config
-def policy_arch_config():
+def policy_arch_config(n_total_steps):
     # policy function
     policy_n_layers = 2                             # number of hidden layers (>=1)
     policy_n_units = 384                            # number of units in each hidden layer
@@ -151,18 +153,27 @@ def policy_arch_config():
     # Parameters for TD3
     td3_policy_delay = 2
     td3_expl_noise = 0.1
+    
 
-    # TD-Gradient parameters
+    # TD-Gradient parameters (MAGE)
     tdg_error_weight = 5.                           # weight to be used for value gradient td learning (in the paper we use alpha=1/tdg_error_weight=0.2)
     td_error_weight = 1.                            # weight for the standard td error for q learning
 
 
+    data_buffer_size = n_total_steps
+
+
+
 # noinspection PyUnusedLocal
 @ex.config
-def infra_config():
+def infra_config(env_name,agent_alg,run_type,run_number):
     use_cuda = True                                 # if true use CUDA
     gpu_id = 0                                      # ID of GPU to use (by default use GPU 0)
     print_config = True                             # Set False if you don't want that (e.g. for regression tests)
+
+    checkpoint = False # Use true to store checkpoints
+    restart_checkpoint = False # Use to load model from an existing checkpoint
+    checkpoint_freq = 25000
 
     if use_cuda and 'CUDA_VISIBLE_DEVICES' not in os.environ:  # gpu_id is used only if CUDA_VISIBLE_DEVICES was not set
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -171,7 +182,8 @@ def infra_config():
     self_dir = os.path.dirname(os.path.abspath(__file__))
     dump_dir = '__default__'                        # Set dump_dir=None if you don't want to be create dump_dir
     if dump_dir == '__default__':
-        dump_dir = os.path.join(self_dir, 'logs', f'{datetime.now().strftime("%Y%m%d%H%M%S")}_{os.getpid()}')
+    #    dump_dir = os.path.join(self_dir, 'logs', f'{datetime.now().strftime("%Y%m%d%H%M%S")}_{os.getpid()}')
+        dump_dir = os.path.join(self_dir, 'results',f'{env_name}',f'{agent_alg}',f'{run_type}',f'{run_number}') # Add this to save file in specif directory
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
     neptune_project = None                          # e.g. yourlogin/sandbox
@@ -181,6 +193,7 @@ def infra_config():
 
 @ex.capture
 def setup(seed, dump_dir, omp_num_threads, print_config, _run):
+    """Sets random seeds and environment variables"""
     if print_config:
         ex.commands["print_config"]()
         print('Shell command:', sacred_utils.get_shell_command())
@@ -189,7 +202,6 @@ def setup(seed, dump_dir, omp_num_threads, print_config, _run):
 
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     torch.set_num_threads(omp_num_threads)
     os.environ['OMP_NUM_THREADS'] = str(omp_num_threads)
     os.environ['MKL_NUM_THREADS'] = str(omp_num_threads)
@@ -199,31 +211,42 @@ def setup(seed, dump_dir, omp_num_threads, print_config, _run):
 
 
 @ex.capture
-def get_env(env_name, record):
+def get_env(env_name, record, seed): # REMOVE seed from argument, only added from testing purposes
+    """Setup the Gym environment"""
     env = gym.make(env_name)
+    # clips actions before calling step.
     env = BoundedActionsEnv(env)
 
+    # Adds done condition
     env = IsDoneEnv(env)
+    # Allows us to close mujoco better
     env = MuJoCoCloseFixWrapper(env)
     if record:
         env = RecordedEnv(env)
+    
+    # REMOVE: Fixed all the seeds ------------
 
     env.seed(np.random.randint(np.iinfo(np.uint32).max))
+    #env.seed(seed) # tried remove this to see if get variable accuracy
+
     if hasattr(env.action_space, 'seed'):  # Only for more recent gym
         env.action_space.seed(np.random.randint(np.iinfo(np.uint32).max))
     if hasattr(env.observation_space, 'seed'):  # Only for more recent gym
         env.observation_space.seed(np.random.randint(np.iinfo(np.uint32).max))
-
     return env
 
 
 @ex.capture
 def get_agent(mode, *, agent_alg):
     logger.debug(f"{ex.step_i:6d} | {mode} | getting fresh agent ...")
+
     if agent_alg == 'td3':
         return get_td3_agent()
+
     if agent_alg == 'ddpg':
         return get_ddpg_agent()
+
+
     raise ValueError(f'Unknown agent alg {agent_alg}')
 
 
@@ -238,7 +261,6 @@ def get_td3_agent(*, d_state, d_action, discount, device, value_tau, value_loss,
                grad_clip=agent_grad_clip, policy_delay=td3_policy_delay,
                tdg_error_weight=tdg_error_weight, td_error_weight=td_error_weight, expl_noise=td3_expl_noise)
 
-
 @ex.capture
 def get_ddpg_agent(*, d_state, d_action, discount, device, value_tau, value_loss, policy_lr,
                    value_lr, policy_n_units, value_n_units, policy_n_layers, value_n_layers, policy_activation,
@@ -248,6 +270,7 @@ def get_ddpg_agent(*, d_state, d_action, discount, device, value_tau, value_loss
                 policy_n_layers=policy_n_layers, value_n_layers=value_n_layers, value_n_units=value_n_units,
                 policy_n_units=policy_n_units, policy_activation=policy_activation, value_activation=value_activation,
                 grad_clip=agent_grad_clip, tdg_error_weight=tdg_error_weight, td_error_weight=td_error_weight)
+
 
 
 @ex.capture
@@ -288,9 +311,9 @@ def get_reward_model(d_action, d_state, reward_n_units, reward_n_layers, reward_
     return model
 
 
-@ex.capture
-def get_imagination(model, initial_states, *, model_sampling_type, policy_actors):
-    return SingleStepImagination(model, initial_states, n_actors=policy_actors, model_sampling_type=model_sampling_type)
+@ex.capture # Return the function (i.e. SingleStepImagination) to generate (imagined) one-step transitions based on the model of environment
+def get_imagination(model, initial_states, *, model_sampling_type, policy_actors,grad_state):
+        return SingleStepImagination(model, initial_states, n_actors=policy_actors, model_sampling_type=model_sampling_type, grad_state=grad_state)
 
 
 @ex.capture
@@ -304,8 +327,8 @@ def get_reward_model_optimizer(params, *, model_lr, model_weight_decay):
 
 
 @ex.capture
-def get_buffer(d_state, d_action, n_total_steps, normalize_data, device):
-    data_buffer_size = n_total_steps
+def get_buffer(d_state, d_action, n_total_steps, normalize_data, device, data_buffer_size):
+
     buffer = Buffer(d_action=d_action, d_state=d_state, size=data_buffer_size)
     if normalize_data:
         buffer.setup_normalizer(TransitionNormalizer(d_state, d_action, device))
@@ -314,7 +337,9 @@ def get_buffer(d_state, d_action, n_total_steps, normalize_data, device):
 
 """ Agent Training """
 
-
+# I don't think this class is used; Mage, taylor and Dyna-TD3, all rely on transition provided by the model (imaginary) which are
+# computed by the class below ImaginationTransitionsProvider, this class should be used for standard td3 methods, which rely on
+# buffer transitions rather than imaginary ones
 class BufferTransitionsProvider:
     def __init__(self, buffer, task, is_done, device, policy_actors):
         self.buffer = buffer
@@ -332,7 +357,8 @@ class BufferTransitionsProvider:
         logps = torch.ones(actions.shape[0], device=self.device) * np.inf
         return states, actions, logps, next_states, rewards, dones
 
-
+# This class relies on input object imagination to generate an imaginary(predicted) transition (i.e. based on the model)
+# it also relies on input task to compute the true reward give the transition and the task
 class ImaginationTransitionsProvider:
     def __init__(self, imagination, task, is_done):
         self.imagination = imagination
@@ -341,27 +367,29 @@ class ImaginationTransitionsProvider:
         self.imagination.reset()
 
     def get_training_transitions(self, agent):
-        states, actions, logps, next_states = self.imagination.many_steps(agent)
-        rewards = self.task(states, actions, next_states)
+        states, actions, logps, next_states = self.imagination.many_steps(agent) # This returns a batch of initial states and the corresponding "imagined" next states with the actions
+        rewards = self.task(states, actions, next_states)  # Here computes the task reward accessing the true reward function for the task
         dones = self.is_done(next_states)
+
         return states, actions, logps, next_states, rewards, dones
 
 
 @ex.capture
 def get_training_data_provider(model, buffer, is_done, task):
-    initial_states, _, _, _ = buffer.view()
-    imagination = get_imagination(model, initial_states)
+    initial_states, _, _, _ = buffer.view() # This returns all inital states so far in the buffer
+    imagination = get_imagination(model, initial_states) # Creates an "imagination" obj needed to generate next states through the ImaginationTransitionsProvider 
     return ImaginationTransitionsProvider(imagination=imagination, task=task, is_done=is_done)
 
 
 @ex.capture
 def train_agent(agent, model, reward_model, buffer, task, task_name, is_done, mode, context_i, *, _run, device,
                 policy_training_n_updates_per_iter, agent_alg, train_reward, policy_training_n_iters):
+    """Policy optimisation step"""
     data_provider = get_training_data_provider(model, buffer, is_done, task)
 
     q_loss, pi_loss = np.nan, np.nan
     for img_step_i in range(1, policy_training_n_iters + 1):
-        states, actions, logps, next_states, rewards, dones = data_provider.get_training_transitions(agent)
+        states, actions, logps, next_states, rewards, dones = data_provider.get_training_transitions(agent) # Key method call where get all the RL variables (s,a,r,s',d)
         if train_reward:
             rewards = reward_model(states, actions, next_states).squeeze(1)
 
@@ -369,7 +397,7 @@ def train_agent(agent, model, reward_model, buffer, task, task_name, is_done, mo
             continue
 
         for img_update_i in range(1, policy_training_n_updates_per_iter + 1):
-            raw_action, q_loss, q_grad_loss, pi_loss = agent.update(states, actions, logps, rewards, next_states, masks=~dones)
+            raw_action, q_loss, q_grad_loss, pi_loss = agent.update(states, actions, logps, rewards, next_states, masks=~dones) # Key method call to the critic and actor update
             # This is rare but can still happen
             if agent.catastrophic_divergence(q_loss, pi_loss):
                 logger.info("Catastrophic divergence detected. Agent reset.")
@@ -471,7 +499,7 @@ def evaluate_on_task(agent, model, buffer, task, task_name, context, *,  _run,
 
     video_file_base = dump_dir + f'/{context}_step_{ex.step_i}_task_{task_name}_episode' + '_{}.mp4' if dump_dir is not None else None
     env_loop = EnvLoop(get_env, render=render, record=record, video_file_base=video_file_base, run=_run)
-    agent = to_deterministic_agent(agent)
+    agent = to_deterministic_agent(agent) # This ensures evalutation performance are based on the deterministic (optimal) action 
 
     # Test agent on real environment by running an episode
     for ep_i in range(1, n_eval_episodes_per_policy + 1):
@@ -553,25 +581,32 @@ def get_neptune_ex(*, neptune_project, _run):
 
 class MainTrainingLoop:
     """ Resembles ray.Trainable """
+
     @ex.capture
     def __init__(self, *, task_name):
         logger.info(f"Executing training...")
-
+        
         tmp_env = get_env(record=False)
         self.is_done = tmp_env.unwrapped.is_done
         self.eval_tasks = {task_name: tmp_env.tasks()[task_name]}
         self.exploitation_task = tmp_env.tasks()[task_name]
         del tmp_env
 
-        # Constitute the state of Trainable
         ex.step_i = 0
+        # initialise the state-space forward model
+        # Note that this uses an ensemble network to calculate uncertainty; we
+        # could replace it with an epinet.
         self.model = get_model()
         self.reward_model = get_reward_model()
+        # Uses the 'Rectified Adam' (arxiv.org/abs/1908.03265) optimiser
         self.model_optimizer = get_model_optimizer(self.model.parameters())
         self.reward_model_optimizer = get_reward_model_optimizer(self.reward_model.parameters())
         self.buffer = get_buffer()
         self.agent = get_agent(mode='train')
+        # setup state, action, state_delta normalisation
         self.agent.setup_normalizer(self.buffer.normalizer)
+        # computes rewards for each time step in the episode. when episode
+        # ends, this logs the total return and episode length
         self.stats = EpisodeStats(self.eval_tasks)
         self.last_avg_eval_score = None
         self.neptune_ex = None
@@ -582,15 +617,40 @@ class MainTrainingLoop:
         self.random_agent = get_random_agent()
 
         self._common_setup()
+        
+        # Use to load a pre-trained model
+        if self.restart_checkpoint and self.dump_dir is not None:
+            model_dir = os.path.join(self.dump_dir,'CheckPoint','Model.pt')
+            MODEL = torch.load(model_dir)
+            self.buffer = MODEL['Memory_buffer']
+            self.agent.actor.load_state_dict(MODEL['Agent'])
+            self.agent.actor_target.load_state_dict(MODEL['Target_Agent'])
+            self.agent.actor_optimizer.load_state_dict(MODEL['Agent_optim'])
+            self.agent.critic.load_state_dict(MODEL['Critic'])
+            self.agent.critic_target.load_state_dict(MODEL['Target_Critic'])
+            self.agent.critic_optimizer.load_state_dict(MODEL['Critic_optim'])
+            self.model.load_state_dict(MODEL['Env_model'])
+            self.model_optimizer.load_state_dict(MODEL['Env_model_optim'])
+            self.reward_model.load_state_dict(MODEL['Rwd_model'])
+            self.reward_model_optimizer.load_state_dict(MODEL['Rwd_model_optim'])
+
+
 
     @ex.capture
-    def _common_setup(self, *, render, record, dump_dir, _run):
-        """ Called in __init__ but needs also to be called after restore (due to reinitialized randomness) """
+    def _common_setup(self, *, render, record, dump_dir,checkpoint, restart_checkpoint, checkpoint_freq, _run):
+        """ Called in __init__ but needs also to be called after restore (due
+        to reinitialized randomness)
+        """
         video_file_base = dump_dir + "/max_exploitation_step_{}.mp4" if dump_dir is not None else None
         self.env_loop = EnvLoop(get_env, render=render, record=record, video_file_base=video_file_base, run=_run)
+        self.checkpoint = checkpoint
+        self.dump_dir = dump_dir
+        self.restart_checkpoint = restart_checkpoint
+        self.checkpoint_freq = checkpoint_freq
 
     def _setup_if_new(self):
-        """ Executed for a new experiment only. This is a workaround for Trainable. """
+        """ Executed for a new experiment only. This is a workaround for
+        Trainable. """
         if self.new_experiment:
             self.new_experiment = False
             self.neptune_ex = get_neptune_ex()
@@ -604,15 +664,21 @@ class MainTrainingLoop:
         self._setup_if_new()
 
         ex.step_i += 1
-
+        
         behavioral_agent = self.random_agent if ex.step_i <= n_warm_up_steps else self.agent
         with torch.no_grad():
-            action = behavioral_agent.get_action(self.env_loop.state, deterministic=False).to('cpu')
+                action = behavioral_agent.get_action(self.env_loop.state, deterministic=False).to('cpu') # KEY: ensure real transition are sampled based on stochastic policy
+        # save s
         prev_state = self.env_loop.state.clone().to(device)
+
         if record and (ex.step_i == 1 or ex.step_i % record_freq == 0):
             self.env_loop.record_next_episode()
+
+        # take a step, s, s' p()
         state, next_state, done = self.env_loop.step(to_np(action), video_file_suffix=ex.step_i)
+        # get reward; r = E(s, a, s')
         reward = self.exploitation_task(state, action, next_state).item()
+        # add transition to the buffer; (s, a, s', r)
         self.buffer.add(state, action, next_state, torch.from_numpy(np.array([[reward]], dtype=np.float)))
         self.stats.add(state, action, next_state, done)
         if done:
@@ -630,8 +696,12 @@ class MainTrainingLoop:
 
         # (Re)train the model on the current buffer
         if model_training_freq is not None and model_training_n_batches > 0 and ex.step_i % model_training_freq == 0:
+            # setup normalisation for actor and critic
             self.model.setup_normalizer(self.buffer.normalizer)
             self.reward_model.setup_normalizer(self.buffer.normalizer)
+            #
+            # train_model is the main event.
+            #
             timed(train_model)(self.model, self.model_optimizer, self.buffer, mode='train')
             if train_reward:
                 task = self.exploitation_task
@@ -641,6 +711,9 @@ class MainTrainingLoop:
         if ex.step_i >= n_warm_up_steps and ex.step_i % policy_training_freq == 0:
             task = self.exploitation_task
             self.agent.setup_normalizer(self.buffer.normalizer)
+            #
+            # train_agent is the main event.
+            #
             self.agent = timed(train_agent)(self.agent, self.model, self.reward_model, self.buffer, task=task, task_name=task_name, is_done=self.is_done,
                                             mode='train', context_i={})
 
@@ -649,6 +722,29 @@ class MainTrainingLoop:
             self.last_avg_eval_score = evaluate_on_tasks(agent=self.agent, model=self.model, buffer=self.buffer, task_name=task_name, context='eval')
 
         experiment_finished = ex.step_i >= n_total_steps
+        
+        if ex.step_i % self.checkpoint_freq == 0  and self.checkpoint and self.dump_dir is not None:
+
+            model_dir = os.path.join(self.dump_dir,'CheckPoint')
+            os.makedirs(model_dir, exist_ok=True)
+            
+            torch.save({
+                'N_step': ex.step_i,
+                'Memory_buffer': self.buffer,
+                'Agent': self.agent.actor.state_dict(),
+                'Target_Agent': self.agent.actor_target.state_dict(),
+                'Agent_optim': self.agent.actor_optimizer.state_dict(),
+                'Critic': self.agent.critic.state_dict(),
+                'Target_Critic': self.agent.critic_target.state_dict(),
+                'Critic_optim': self.agent.critic_optimizer.state_dict(),
+                'Env_model' : self.model.state_dict(),
+                'Env_model_optim': self.model_optimizer.state_dict(),
+                'Train_rwd': train_reward,
+                'Rwd_model': self.reward_model.state_dict(),
+                'Rwd_model_optim': self.reward_model_optimizer.state_dict(),
+            }, os.path.join(model_dir,'Model.pt'))
+
+
         return DotMap(
             done=experiment_finished,
             avg_eval_score=self.last_avg_eval_score,
@@ -666,9 +762,14 @@ class MainTrainingLoop:
 
 @ex.automain
 def train():
+    
+    # Ensure cuda is available
+    assert torch.cuda.is_available(), "No GPU"
+    # main entrypoint.
     setup()
     training = MainTrainingLoop()
 
+    # dot-access dict subclass.
     res = DotMap(done=False)
     while not res.done:
         res = training.train()
