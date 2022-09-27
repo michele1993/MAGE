@@ -33,9 +33,7 @@ import sacred_utils  # For a custom mongodb flag
 from radam import RAdam
 from reward_model import RewardModel
 from td3 import TD3
-from td3_taylor import TD3_Taylor
 from ddpg import DDPG
-from Residual_MAGE import Residual_MAGE
 from wrappers import BoundedActionsEnv, IsDoneEnv, MuJoCoCloseFixWrapper, RecordedEnv
 from buffer import Buffer
 from models import Model
@@ -166,7 +164,7 @@ def policy_arch_config(n_total_steps):
 
 # noinspection PyUnusedLocal
 @ex.config
-def infra_config(env_name,agent_alg,run_type,run_number):
+def infra_config(env_name,agent_alg, tdg_error_weight, run_type,run_number):
     use_cuda = True                                 # if true use CUDA
     gpu_id = 0                                      # ID of GPU to use (by default use GPU 0)
     print_config = True                             # Set False if you don't want that (e.g. for regression tests)
@@ -181,9 +179,15 @@ def infra_config(env_name,agent_alg,run_type,run_number):
 
     self_dir = os.path.dirname(os.path.abspath(__file__))
     dump_dir = '__default__'                        # Set dump_dir=None if you don't want to be create dump_dir
+   
+    if tdg_error_weight != 0:
+        update_dir = 'MAGE'
+    else:
+        update_dir = 'TD3'
+
     if dump_dir == '__default__':
     #    dump_dir = os.path.join(self_dir, 'logs', f'{datetime.now().strftime("%Y%m%d%H%M%S")}_{os.getpid()}')
-        dump_dir = os.path.join(self_dir, 'results',f'{env_name}',f'{agent_alg}',f'{run_type}',f'{run_number}') # Add this to save file in specif directory
+        dump_dir = os.path.join(self_dir, 'results',f'{env_name}',f'{agent_alg}',f'{run_type}',update_dir,f'{run_number}') # Add this to save file in specif directory
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
     neptune_project = None                          # e.g. yourlogin/sandbox
@@ -312,8 +316,8 @@ def get_reward_model(d_action, d_state, reward_n_units, reward_n_layers, reward_
 
 
 @ex.capture # Return the function (i.e. SingleStepImagination) to generate (imagined) one-step transitions based on the model of environment
-def get_imagination(model, initial_states, *, model_sampling_type, policy_actors,grad_state):
-        return SingleStepImagination(model, initial_states, n_actors=policy_actors, model_sampling_type=model_sampling_type, grad_state=grad_state)
+def get_imagination(model, initial_states, *, model_sampling_type, policy_actors):
+        return SingleStepImagination(model, initial_states, n_actors=policy_actors, model_sampling_type=model_sampling_type)
 
 
 @ex.capture
